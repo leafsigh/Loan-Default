@@ -1,0 +1,554 @@
+---
+title: "Default prediction"
+output: html_document
+---
+
+
+```{r}
+application2016<-read.csv('application2016.csv',header = TRUE)
+application2017<-read.csv('application2017.csv',header = TRUE)
+```
+
+```{r}
+require(dplyr)
+require(tidyverse)
+require(MASS)
+require(C50)
+require(glmnet)
+require(boot)
+require(stargazer)
+require(rpart)
+require(rpart.plot)
+require(gmodels)
+require(ggplot2)
+require(tree)
+```
+
+# Data pretreatment
+```{r}
+avg_unemploy<-application2016%>%
+  group_by(statecode)%>%
+  summarise(avg_unemploy_rate = mean(unemprate))
+
+application2016<-left_join(application2016,avg_unemploy)
+
+application2016<-application2016 %>%
+  mutate(net_asset = asset-debt,
+         avg_inc = (W2inc_m1+W2inc_m2)/2,
+         group_loan_amt = cut(loan_amt, breaks=30, include.lowest = TRUE),
+         group_age = cut(age, breaks=6, include.lowest = TRUE),
+         profit = amt_paid - loan_amt,
+         howmuch_default = amt_paid - amt_due,
+         default =((amt_paid - amt_due)<0)*1) %>%
+  dplyr::select(-(2:4),-(16:17))
+
+#application2016$default<-factor(application2016$default,levels=c(0,1),labels=c('NO','YES'))
+
+application2016[application2016$loan_amt==max(application2016$loan_amt),]
+application2016<-application2016[-233,]
+```
+
+
+```{r}
+head(application2016)
+str(application2016)
+```
+
+# Roughly examine causal effect
+
+Loan amount vs. Default amount
+
+```{r}
+ggplot(data = application2016)+
+  geom_point(mapping = aes(x=loan_amt,y=howmuch_default),color = 'red', size = 2)+
+    geom_smooth(mapping = aes(x=loan_amt,y=howmuch_default),method = 'lm', color = 'darkgreen',se = FALSE)+
+  xlim(30000,100000)+
+  ylim(-75000,100)
+
+loanamt_default<-glm(data=application2016, default~loan_amt,family = binomial(link = 'logit'))
+loanamt_default$fitted.values
+```
+Age vs. Default amount
+```{r}
+age_summary1<-application2016%>%
+  group_by(age)%>%
+  summarise(age_default = sum(howmuch_default),age_default_count = sum(default))
+
+ggplot(data = age_summary1)+
+  geom_col(mapping = aes(x=age,y=age_default_count))
+```
+```{r}
+age_summary2<-application2016%>%
+  group_by(group_age)%>%
+  summarise(age_default = sum(howmuch_default),age_default_count = sum(default))
+
+ggplot(data=age_summary2)+
+  geom_col(aes(x=group_age,y=age_default_count))
+```
+
+
+Married vs Default
+```{r}
+CrossTable(application2016$married,application2016$default, prop.chisq = FALSE, prop.t = FALSE, dnn = c('married','default'))
+```
+
+Educ vs Default
+```{r}
+CrossTable(application2016$educ,application2016$default, prop.chisq = FALSE, prop.t = FALSE, dnn = c('educ','default'))
+```
+
+Income vs Default
+```{r}
+ggplot(data = application2016,aes(y=howmuch_default))+
+  geom_point(aes(x=W2inc_m1),color='darkgreen',alpha=0.5)+
+  geom_point(aes(x=W2inc_m2),color='firebrick',alpha=0.5)+
+  geom_smooth(method = 'lm',aes(x=W2inc_m1),se=FALSE)+
+  geom_smooth(method = 'lm',aes(x=W2inc_m2),se=FALSE,color='red')+
+  geom_smooth(method = 'lm',aes(x=avg_inc),se=FALSE, color='green')+
+  ylim(-75000,3000)
+```
+
+Tax dependent vs Default
+```{r}
+CrossTable(application2016$taxdependent,application2016$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('tax dependent','default'))
+```
+
+Credit score vs Default
+```{r}
+ggplot(data = application2016,aes(y=howmuch_default))+
+  geom_point(aes(x=creditscore),color='darkgreen',alpha=1)+
+  geom_smooth(method = 'lm',aes(x=creditscore),se=FALSE)+
+  ylim(-50000,5000)
+```
+
+Unemployment (state) vs Default
+```{r}
+ggplot(data = application2016,aes(y=howmuch_default))+
+  geom_point(aes(x=unemprate),color='darkgreen',alpha=1)+
+  geom_smooth(method = 'lm',aes(x=unemprate),se=FALSE)+
+  ylim(-100000,5000)
+```
+```{r}
+avg_unemploy
+```
+```{r}
+state_group<-application2016%>%
+  group_by(statecode)%>%
+  summarise(state_default = sum(howmuch_default),state_default_cnt=sum(default))
+ggplot(data = state_group)+
+  geom_col(aes(x=statecode,y=state_default_cnt))
+  
+```
+
+Avg homeprice vs Default
+```{r}
+ggplot(data=application2016)+
+  geom_point(aes(x=avg_homeprice,y=howmuch_default),color='yellow')+
+  geom_smooth(method='lm',aes(x=avg_homeprice,y=howmuch_default),se=FALSE)+
+  ylim(-100000,3000)
+```
+
+Net asset vs Default
+```{r}
+ggplot(data=application2016)+
+  geom_point(aes(x=net_asset,y=howmuch_default),color='pink')+
+  geom_smooth(method='lm',aes(x=net_asset,y=howmuch_default),se=FALSE)+
+  ylim(-100000,3000)
+```
+
+
+
+# Logistic Regression, LASSO & Cross Validation
+
+1) Set training and test data
+```{r}
+set.seed(449)
+train<-sample(249,150,replace=FALSE)
+application2016_train<-application2016[train,]
+application2016_test<-application2016[-train,]
+```
+
+
+2) Put data in matrix for glmnet function
+```{r}
+y_profit<-application2016_train$profit
+y_howmuch_default<-application2016_train$howmuch_default
+y_default<-application2016_train$default
+
+x_profit<-model.matrix(data=application2016_train, profit~0+loan_amt+factor(statecode)+age+married+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+avg_homeprice+net_asset)
+x_howmuch_default<-model.matrix(data=application2016_train, howmuch_default~0+loan_amt+factor(statecode)+age+married+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+avg_homeprice+net_asset)
+x_default<-model.matrix(data=application2016_train, default~0+loan_amt+factor(statecode)+age+married+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+avg_homeprice+net_asset)
+```
+
+3) Set lambda and find the best model
+```{r}
+set.seed(944)
+grid <- seq(from = 0, to=10000, by=1)
+
+lasso_cv_profit <- cv.glmnet(x_profit, y_profit, alpha = 1, nfolds = 5, lambda = grid)
+lasso_cv_howmuch_default <- cv.glmnet(x_howmuch_default, y_howmuch_default, alpha = 1, nfolds = 5,lambda = grid)
+
+#This model is what we need.
+lasso_cv_default <- cv.glmnet(x_default, y_default, alpha = 1, nfolds = 5, family ='binomial')
+
+#plot(x=lasso_cv_profit$lambda, y=lasso_cv_profit$cvm )
+#plot(x=lasso_cv_howmuch_default$lambda, y=lasso_cv_howmuch_default$cvm )
+#plot(x=lasso_cv_default$lambda, y=lasso_cv_default$cvm )
+
+plot.cv.glmnet(lasso_cv_profit)
+plot.cv.glmnet(lasso_cv_howmuch_default)
+plot.cv.glmnet(lasso_cv_default)
+
+bestlam_profit <- lasso_cv_profit$lambda.min
+bestlam_howmuch_default <- lasso_cv_howmuch_default$lambda.min
+
+#This is the lambda we need.
+bestlam_default <- lasso_cv_default$lambda.min
+
+lambda_matrix<-data_frame(bestlam_profit,bestlam_howmuch_default,bestlam_default)
+lambda_matrix
+```
+
+4) Find most relevant variables
+```{r}
+coef.cv.glmnet(lasso_cv_default, s = bestlam_default)
+```
+
+5) Predict default and profit by LASSO model
+```{r}
+test_x_profit<-model.matrix(data=application2016_test, profit~loan_amt+factor(statecode)+age+married+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+avg_homeprice+net_asset)
+test_x_howmuch_default<-model.matrix(data=application2016_test, howmuch_default~loan_amt+factor(statecode)+age+married+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+avg_homeprice+net_asset)
+test_x_default<-model.matrix(data=application2016_test, default~loan_amt+factor(statecode)+age+married+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+avg_homeprice+net_asset)
+
+predict_profit<-predict(lasso_cv_profit, newx = test_x_profit, s=bestlam_profit,type='response')
+predict_howmuch_default<-predict(lasso_cv_howmuch_default, newx = test_x_howmuch_default, s=bestlam_howmuch_default,type = 'response')
+predict_default_prob<-predict(lasso_cv_default, newx = test_x_default, s=bestlam_default, type = 'response')
+
+compare_mat<-data_frame(application2016_test$profit,predict_profit[,1],application2016_test$howmuch_default,predict_howmuch_default[,1],application2016_test$default,predict_default_prob[,1])
+
+comapre_mat<-mutate(compare_mat,predict_default=(predict_default_prob[,1]>=0.5)*1)
+```
+
+```{r}
+CrossTable(comapre_mat$predict_default,comapre_mat$`application2016_test$default`,prop.chisq = FALSE, prop.t = FALSE, dnn=c('predict','fact'))
+```
+7) Predict profit
+```{r}
+application2016_test<-mutate(application2016_test,Lasso_cv_predict_default=comapre_mat$predict_default)
+
+Lasso_cv_predict_profit<-sum(application2016_test$profit*(application2016_test$Lasso_cv_predict_default==0))
+
+# profit for test data
+Lasso_cv_predict_profit
+```
+
+
+# Logistic regression & LOOCV
+
+1) Generate a new column for statecode=5, which is one of the core variable.
+```{r}
+application2016<-mutate(application2016, state5=(statecode==5))
+set.seed(449)
+train<-sample(249,150,replace=FALSE)
+application2016_train<-application2016[train,]
+application2016_test<-application2016[-train,]
+```
+
+2) Do the Logistic Regression for different models
+```{r}
+# All Core variables
+logistic0<-glm(data = application2016_train, default~avg_inc+creditscore+net_asset+state5,family = binomial(link='logit'))
+
+log_loocv0<-cv.glm(application2016_train,logistic0)
+mse0<-log_loocv0$delta[1]
+
+# No avg_inc
+logistic1<-glm(data = application2016_train, default~creditscore+net_asset+state5,family = binomial(link='logit'))
+
+log_loocv1<-cv.glm(application2016_train,logistic1)
+mse1<-log_loocv1$delta[1]
+
+# No credit score
+logistic2<-glm(data = application2016_train, default~avg_inc+net_asset+state5,family = binomial(link='logit'))
+
+log_loocv2<-cv.glm(application2016_train,logistic2)
+mse2<-log_loocv2$delta[1]
+
+# No net asset
+logistic3<-glm(data = application2016_train, default~avg_inc+creditscore+net_asset+state5,family = binomial(link='logit'))
+
+log_loocv3<-cv.glm(application2016_train,logistic3)
+mse3<-log_loocv3$delta[1]
+
+# No state5
+logistic4<-glm(data = application2016_train, default~avg_inc+creditscore+net_asset,family = binomial(link='logit'))
+
+log_loocv4<-cv.glm(application2016_train,logistic4)
+mse4<-log_loocv4$delta[1]
+
+# Some other models (including single variables, polynomials and so on)
+logistic5<-glm(data = application2016_train, default~loan_amt+age+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+net_asset,family = binomial(link='logit'))
+
+log_loocv5<-cv.glm(application2016_train,logistic5)
+mse5<-log_loocv5$delta[1]
+
+logistic6<-glm(data = application2016_train, default~age+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+net_asset,family = binomial(link='logit'))
+
+log_loocv6<-cv.glm(application2016_train,logistic6)
+mse6<-log_loocv6$delta[1]
+
+logistic7<-glm(data = application2016_train, default~loan_amt+poly(age,2,raw=TRUE)+educ+avg_inc+taxdependent+creditscore+avg_unemploy_rate+net_asset,family = binomial(link='logit'))
+
+log_loocv7<-cv.glm(application2016_train,logistic7)
+mse7<-log_loocv7$delta[1]
+
+logistic8<-glm(data = application2016_train, default~loan_amt+age+avg_inc+taxdependent+creditscore+avg_unemploy_rate+net_asset,family = binomial(link='logit'))
+
+log_loocv8<-cv.glm(application2016_train,logistic8)
+mse8<-log_loocv8$delta[1]
+
+logistic9<-glm(data = application2016_train, default~loan_amt+age+educ+avg_inc+taxdependent+creditscore+net_asset,family = binomial(link='logit'))
+
+log_loocv9<-cv.glm(application2016_train,logistic9)
+mse9<-log_loocv9$delta[1]
+
+logistic10<-glm(data = application2016_train, default~loan_amt+age+educ+avg_inc+taxdependent+creditscore+factor(statecode)+net_asset,family = binomial(link='logit'))
+
+log_loocv10<-cv.glm(application2016_train,logistic10)
+mse10<-log_loocv10$delta[1]
+
+logistic11<-glm(data = application2016_train, default~loan_amt+age+educ+avg_inc+taxdependent+creditscore,family = binomial(link='logit'))
+
+log_loocv11<-cv.glm(application2016_train,logistic11)
+mse11<-log_loocv11$delta[1]
+
+logistic12<-glm(data = application2016_train, default~creditscore,family = binomial(link='logit'))
+
+log_loocv12<-cv.glm(application2016_train,logistic12)
+mse12<-log_loocv12$delta[1]
+
+logistic13<-glm(data = application2016_train, default~avg_inc,family = binomial(link='logit'))
+
+log_loocv13<-cv.glm(application2016_train,logistic13)
+mse13<-log_loocv13$delta[1]
+
+logistic14<-glm(data = application2016_train, default~avg_inc+creditscore,family = binomial(link='logit'))
+
+log_loocv14<-cv.glm(application2016_train,logistic14)
+mse14<-log_loocv14$delta[1]
+```
+
+3)Comapre MSEs
+```{r}
+mse_dtframe<-data_frame(mse1,mse2,mse3,mse4,mse5,mse6,mse7,mse8,mse9,mse10,mse11,mse12,mse13,mse14)
+mse_dtframe
+```
+
+
+```{r}
+application2016_logi<-mutate(application2016_train,fit_value1=(logistic1$fitted.values>=0.5)*1, fit_value2=(logistic2$fitted.values>=0.5)*1, fit_value3=(logistic3$fitted.values>=0.5)*1, fit_value6=(logistic6$fitted.values>=0.5)*1,fit_value8=(logistic8$fitted.values>=0.5)*1)
+```
+
+4) Make the cross table comparison (both for train data and test data)
+```{r}
+#Train data cross table
+CrossTable(application2016_logi$fit_value1,application2016_logi$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('predict','fact'))
+CrossTable(application2016_logi$fit_value2,application2016_logi$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('predict','fact'))
+CrossTable(application2016_logi$fit_value3,application2016_logi$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('predict','fact'))
+CrossTable(application2016_logi$fit_value6,application2016_logi$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('predict','fact'))
+CrossTable(application2016_logi$fit_value8,application2016_logi$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('predict','fact'))
+```
+```{r}
+#Test data cross table
+application2016_test<-mutate(application2016_test,logit_prediction1=(predict(logistic1,application2016_test,type = 'response')>=0.5)*1,logit_prediction2=(predict(logistic2,application2016_test,type = 'response')>=0.5)*1,logit_prediction3=(predict(logistic3,application2016_test,type = 'response')>=0.5)*1,logit_prediction6=(predict(logistic6,application2016_test,type = 'response')>=0.5)*1,logit_prediction8=(predict(logistic8,application2016_test,type = 'response')>=0.5)*1)
+
+CrossTable(application2016_test$logit_prediction1,application2016_test$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('prediction','fact'))
+CrossTable(application2016_test$logit_prediction2,application2016_test$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('prediction','fact'))
+CrossTable(application2016_test$logit_prediction3,application2016_test$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('prediction','fact'))
+CrossTable(application2016_test$logit_prediction6,application2016_test$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('prediction','fact'))
+CrossTable(application2016_test$logit_prediction8,application2016_test$default,prop.chisq = FALSE, prop.t = FALSE, dnn = c('prediction','fact'))
+```
+
+5) Compare the predicted profit (for test data)
+```{r}
+logit_model1_predict_profit_for_test_data<-sum((application2016_test$logit_prediction2==0)*application2016_test$profit)
+logit_model2_predict_profit_for_test_data<-sum((application2016_test$logit_prediction2==0)*application2016_test$profit)
+logit_model3_predict_profit_for_test_data<-sum((application2016_test$logit_prediction2==0)*application2016_test$profit)
+logit_model6_predict_profit_for_test_data<-sum((application2016_test$logit_prediction6==0)*application2016_test$profit)
+logit_model8_predict_profit_for_test_data<-sum((application2016_test$logit_prediction8==0)*application2016_test$profit)
+predict_test_data_profit<-data_frame(logit_model1_predict_profit_for_test_data,logit_model2_predict_profit_for_test_data,logit_model3_predict_profit_for_test_data,logit_model6_predict_profit_for_test_data,logit_model8_predict_profit_for_test_data)
+`colnames<-`(predict_test_data_profit,c('model1','model2','model3','model6','model8'))
+```
+
+# Decision Tree Part
+
+Based on C5.0 Algorithm
+
+1)Factorize explained variables (which C5.0 requires)
+```{r}
+application2016_tree_train<-application2016_train
+application2016_tree_test<-application2016_test
+
+#C5.0 requires explained variable is factor, therefore we factorized it.
+application2016_tree_train$default<-factor(application2016_tree_train$default,levels=c(0,1),labels=c('NO','YES'))
+application2016_tree_test$default<-factor(application2016_tree_test$default,levels=c(0,1),labels=c('NO','YES'))
+```
+
+2) Estimate models
+```{r}
+error_cost<-matrix(c(0,1,3,0),nrow=2)
+
+C50_tree_model1<-C5.0(data = application2016_tree_train, default~creditscore+net_asset+avg_inc, trials=10,costs=error_cost)
+C50_tree_model2<-C5.0(data = application2016_tree_train, default~loan_amt+factor(statecode)+age+factor(married)+educ+taxdependent+creditscore+avg_homeprice+avg_unemploy_rate+net_asset+avg_inc, trials=10, costs=error_cost)
+C50_tree_model3<-C5.0(data = application2016_tree_train, default~loan_amt+age+educ+taxdependent+creditscore+avg_homeprice+avg_unemploy_rate+net_asset+avg_inc, trials=10,costs=error_cost)
+C50_tree_model4<-C5.0(data = application2016_tree_train, default~creditscore+avg_inc, trials=10,costs=error_cost)
+C50_tree_model5<-C5.0(data = application2016_tree_train, default~creditscore, trials=10,costs=error_cost)
+C50_tree_model6<-C5.0(data = application2016_tree_train, default~creditscore+avg_inc, trials=10,costs=error_cost)
+
+```
+3) Make predictions both for train and test data
+```{r}
+C50tree_predict_train1<-predict(C50_tree_model1,application2016_tree_train)
+CrossTable(application2016_tree_train$default,C50tree_predict_train1,dnn = c('fact','predict'))
+C50tree_predict_train2<-predict(C50_tree_model2,application2016_tree_train)
+CrossTable(application2016_tree_train$default,C50tree_predict_train2,dnn = c('fact','predict'))
+C50tree_predict_train3<-predict(C50_tree_model3,application2016_tree_train)
+CrossTable(application2016_tree_train$default,C50tree_predict_train3,dnn = c('fact','predict'))
+C50tree_predict_train4<-predict(C50_tree_model4,application2016_tree_train)
+CrossTable(application2016_tree_train$default,C50tree_predict_train4,dnn = c('fact','predict'))
+C50tree_predict_train5<-predict(C50_tree_model5,application2016_tree_train)
+CrossTable(application2016_tree_train$default,C50tree_predict_train5,dnn = c('fact','predict'))
+C50tree_predict_train6<-predict(C50_tree_model6,application2016_tree_train)
+CrossTable(application2016_tree_train$default,C50tree_predict_train6,dnn = c('fact','predict'))
+
+C50tree_profit_train1 = sum((C50tree_predict_train1=='NO')*application2016_tree_train$profit)
+C50tree_profit_train2 = sum((C50tree_predict_train2=='NO')*application2016_tree_train$profit)
+C50tree_profit_train3 = sum((C50tree_predict_train3=='NO')*application2016_tree_train$profit)
+C50tree_profit_train4 = sum((C50tree_predict_train4=='NO')*application2016_tree_train$profit)
+C50tree_profit_train5 = sum((C50tree_predict_train5=='NO')*application2016_tree_train$profit)
+C50tree_profit_train6 = sum((C50tree_predict_train6=='NO')*application2016_tree_train$profit)
+C50predicted_profit_train<-data_frame(C50tree_profit_train1,C50tree_profit_train2,C50tree_profit_train3,C50tree_profit_train4,C50tree_profit_train5,C50tree_profit_train6)
+```
+4) Comparison between test data prediction
+```{r}
+
+C50tree_predict_test1<-predict(C50_tree_model1,application2016_tree_test)
+CrossTable(application2016_tree_test$default,C50tree_predict_test1,dnn = c('fact','predict'))
+C50tree_predict_test2<-predict(C50_tree_model2,application2016_tree_test)
+CrossTable(application2016_tree_test$default,C50tree_predict_test2,dnn = c('fact','predict'))
+C50tree_predict_test3<-predict(C50_tree_model3,application2016_tree_test)
+CrossTable(application2016_tree_test$default,C50tree_predict_test3,dnn = c('fact','predict'))
+C50tree_predict_test4<-predict(C50_tree_model4,application2016_tree_test)
+CrossTable(application2016_tree_test$default,C50tree_predict_test4,dnn = c('fact','predict'))
+C50tree_predict_test5<-predict(C50_tree_model5,application2016_tree_test)
+CrossTable(application2016_tree_test$default,C50tree_predict_test5,dnn = c('fact','predict'))
+C50tree_predict_test6<-predict(C50_tree_model6,application2016_tree_test)
+CrossTable(application2016_tree_test$default,C50tree_predict_test6,dnn = c('fact','predict'))
+
+C50tree_profit_test1 = sum((C50tree_predict_test1=='NO')*application2016_tree_test$profit)
+C50tree_profit_test2 = sum((C50tree_predict_test2=='NO')*application2016_tree_test$profit)
+C50tree_profit_test3 = sum((C50tree_predict_test3=='NO')*application2016_tree_test$profit)
+C50tree_profit_test4 = sum((C50tree_predict_test4=='NO')*application2016_tree_test$profit)
+C50tree_profit_test5 = sum((C50tree_predict_test5=='NO')*application2016_tree_test$profit)
+C50tree_profit_test6 = sum((C50tree_predict_test6=='NO')*application2016_tree_test$profit)
+
+C50tree_profit_test_comapre_mat<-data_frame(C50tree_profit_test1,C50tree_profit_test2,C50tree_profit_test3,C50tree_profit_test4,C50tree_profit_test5,C50tree_profit_test6)
+C50tree_profit_test_comapre_mat
+```
+
+
+Rpart model
+
+1) Estimate models
+```{r}
+# Rpart models
+rpart_tree_model1<-rpart(data = application2016_tree_train, default~state5+creditscore+net_asset+avg_inc,method = "class",control = rpart.control(cp=0.001),parms = list(loss = matrix(c(0, 4, 1, 0), ncol = 2)))
+rpart_tree_model2<-rpart(data = application2016_tree_train, default~loan_amt+factor(statecode)+age+factor(married)+educ+taxdependent+creditscore+avg_homeprice+avg_unemploy_rate+net_asset+avg_inc,method = "class",control = rpart.control(cp=0.001),parms = list(loss = matrix(c(0, 4, 1, 0), ncol = 2)))
+rpart_tree_model3<-rpart(data = application2016_tree_train, default~loan_amt+age+factor(married)+educ+taxdependent+creditscore+avg_homeprice+avg_unemploy_rate+net_asset+avg_inc,method = "class",control = rpart.control(cp=0.001),parms = list(loss = matrix(c(0, 4, 1, 0), ncol = 2)))
+rpart_tree_model4<-rpart(data = application2016_tree_train, default~loan_amt+age+taxdependent+creditscore+avg_homeprice+avg_unemploy_rate+net_asset+avg_inc,method = "class",control = rpart.control(cp=0.001),parms = list(loss = matrix(c(0, 4, 1, 0), ncol = 2)))
+rpart_tree_model5<-rpart(data = application2016_tree_train, default~creditscore, method = "class",control = rpart.control(cp=0.001),parms = list(loss = matrix(c(0, 4, 1, 0), ncol = 2)))
+rpart_tree_model6<-rpart(data = application2016_tree_train, default~creditscore+avg_inc, method = "class",control = rpart.control(cp=0.001),parms = list(loss = matrix(c(0, 4, 1, 0), ncol = 2)))
+
+# Only plot the second model
+prp(rpart_tree_model2, extra = 1, box.palette = "auto")
+
+```
+
+2) Predict default in test data and compare profits
+```{r}
+# Predict in the test data
+raprt_tree_predict_prob1 <- predict (rpart_tree_model1, newdata = application2016_tree_test)
+raprt_tree_predict_prob2 <- predict (rpart_tree_model2, newdata = application2016_tree_test)
+raprt_tree_predict_prob3 <- predict (rpart_tree_model3, newdata = application2016_tree_test)
+raprt_tree_predict_prob4 <- predict (rpart_tree_model4, newdata = application2016_tree_test)
+raprt_tree_predict_prob5 <- predict (rpart_tree_model5, newdata = application2016_tree_test)
+raprt_tree_predict_prob6 <- predict (rpart_tree_model6, newdata = application2016_tree_test)
+
+raprt_tree_predict_default1<-(raprt_tree_predict_prob1[,2]>=0.5)*1
+CrossTable(application2016_test$default,raprt_tree_predict_default1,dnn=c('fact','predict'))
+rpart_tree_profit_test1<-sum((raprt_tree_predict_default1==0)*application2016_tree_test$profit)
+
+raprt_tree_predict_default2<-(raprt_tree_predict_prob2[,2]>=0.5)*1
+CrossTable(application2016_test$default,raprt_tree_predict_default2,dnn=c('fact','predict'))
+rpart_tree_profit_test2<-sum((raprt_tree_predict_default2==0)*application2016_tree_test$profit)
+
+raprt_tree_predict_default3<-(raprt_tree_predict_prob3[,2]>=0.5)*1
+CrossTable(application2016_test$default,raprt_tree_predict_default3,dnn=c('fact','predict'))
+rpart_tree_profit_test3<-sum((raprt_tree_predict_default3==0)*application2016_tree_test$profit)
+
+raprt_tree_predict_default4<-(raprt_tree_predict_prob4[,2]>=0.5)*1
+CrossTable(application2016_test$default,raprt_tree_predict_default4,dnn=c('fact','predict'))
+rpart_tree_profit_test4<-sum((raprt_tree_predict_default4==0)*application2016_tree_test$profit)
+
+raprt_tree_predict_default5<-(raprt_tree_predict_prob5[,2]>=0.5)*1
+CrossTable(application2016_test$default,raprt_tree_predict_default5,dnn=c('fact','predict'))
+rpart_tree_profit_test5<-sum((raprt_tree_predict_default5==0)*application2016_tree_test$profit)
+
+raprt_tree_predict_default6<-(raprt_tree_predict_prob6[,2]>=0.5)*1
+CrossTable(application2016_test$default,raprt_tree_predict_default6,dnn=c('fact','predict'))
+rpart_tree_profit_test6<-sum((raprt_tree_predict_default6==0)*application2016_tree_test$profit)
+
+rparttree_predict_profit_test<-data_frame(rpart_tree_profit_test1,rpart_tree_profit_test2,rpart_tree_profit_test3,rpart_tree_profit_test4,rpart_tree_profit_test5,rpart_tree_profit_test6)
+
+rparttree_predict_profit_test
+```
+
+
+# The Best Models Competition
+```{r}
+final_profit_compare_mat<-data_frame(LASSO=373485, Logistic_model1=247141, C50_model3=276915, rpart_model5=381453)
+final_misclassification_mat1<-data_frame(LASSO=14/99, Logistic_model1=14/99, C50_model3=13/99, rpart_model5=4/99)
+final_misclassification_mat2<-data_frame(LASSO=(14+23)/99, Logistic_model1=(14+25)/99, C50_model3=(13+30)/99, rpart_model5=(4+31)/99)
+final_profit_compare_mat
+final_misclassification_mat1
+final_misclassification_mat2
+```
+
+
+# The final winner is the rpart model.
+# Now, we will estimate application2017.csv file
+
+```{r}
+avg_unemploy2017<-application2017%>%
+  group_by(statecode)%>%
+  summarise(avg_unemploy_rate2 = mean(unemprate))
+
+application2017<-left_join(application2017,avg_unemploy2017)
+
+application2017<-application2017 %>%
+  mutate(net_asset = asset-debt,
+         avg_inc = (W2inc_m1+W2inc_m2)/2)
+
+application2017_predict<-predict(rpart_tree_model5, newdata = application2017)
+application2017_default<-(application2017_predict[,2]>=0.5)*1
+sum(application2017_default==0)
+output<-application2017%>%
+  dplyr::select((1:2))
+output<-mutate(output,approve=application2017_default)
+
+```
+```{r}
+output
+write.csv(output,file = 'final_approval.csv')
+```
+
